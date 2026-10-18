@@ -63,6 +63,7 @@ declare module 'mp4box' {
   }
 
   export interface MP4TrackBox {
+    samples?: MP4Sample[];
     id?: number;
     samples_duration?: number;
     tkhd?: {

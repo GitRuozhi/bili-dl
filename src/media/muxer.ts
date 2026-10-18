@@ -34,12 +34,27 @@ export async function muxMp4(
   );
   return new Promise((resolve, reject) => {
     try {
+      if (audioBuffer && audioBuffer.byteLength === 0) throw new Error('音频流为空');
       const outMp4 = MP4Box.createFile();
       const inVideo = MP4Box.createFile();
       const inAudio = audioBuffer && audioBuffer.byteLength > 0 ? MP4Box.createFile() : null;
 
       let videoOutTrackId: number | null = null;
       let audioOutTrackId: number | null = null;
+
+      let videoSamples = 0;
+      let audioSamples = 0;
+      let videoSourceId: number | undefined;
+      let audioSourceId: number | undefined;
+      let parseError: string | undefined;
+      const validateTrack = (input: typeof inVideo, id: number | undefined, outputId: number | null, count: number, label: string) => {
+        if (parseError) throw new Error(parseError);
+        if (id === undefined || outputId == null || count === 0) throw new Error(`${label}未能提取有效样本`);
+        // 分片 MP4 的 onReady 可能早于 moof 解析，此时 nb_samples 仍为 0。
+        // flush 后用完整样本表核对，避免将截断媒体的部分样本当成完整结果。
+        const expected = input.getTrackById(id)?.samples?.length;
+        if (expected === undefined || count !== expected) throw new Error(`${label}样本不完整: 预期 ${expected ?? '未知'}，实际 ${count}`);
+      };
 
       let videoDone = false;
       let audioDone = !inAudio;
@@ -79,8 +94,7 @@ export async function muxMp4(
               onProgress?.(100);
               resolve(new Blob([buffer], { type: 'video/mp4' }));
             } else {
-              logger.warn('Muxer', '封装输出为空，降级回退原始视频流', null, traceId);
-              resolve(new Blob([videoBuffer], { type: 'video/mp4' }));
+              throw new Error('MP4 封装输出为空');
             }
           } catch (e: unknown) {
             const msg = getErrorMessage(e);
@@ -95,6 +109,7 @@ export async function muxMp4(
         if (info.videoTracks.length > 0) {
           const track = info.videoTracks[0];
           if (track) {
+            videoSourceId = track.id;
             const inTrak = inVideo.getTrackById(track.id) || inVideo.moov?.traks?.[0];
             const entry = inTrak?.mdia?.minf?.stbl?.stsd?.entries?.[0];
             const entryType = entry?.type || (track.codec ? track.codec.substring(0, 4) : 'avc1');
@@ -134,6 +149,8 @@ export async function muxMp4(
           for (let i = 0; i < samples.length; i++) {
             const sample = samples[i];
             if (sample) {
+              if (sample.data.byteLength === 0) throw new Error('视频样本为空');
+              videoSamples++;
               outMp4.addSample(videoOutTrackId, sample.data, {
                 duration: sample.duration,
                 dts: sample.dts,
@@ -152,7 +169,7 @@ export async function muxMp4(
       };
 
       inVideo.onError = (err) => {
-        logger.warn('Muxer', `视频样本解析警告: ${err}`);
+        parseError = `视频样本解析失败: ${err}`;
       };
 
       // 2. 音频轨解析与样本抽取（如果存在）
@@ -161,6 +178,7 @@ export async function muxMp4(
           if (info.audioTracks.length > 0) {
             const track = info.audioTracks[0];
             if (track) {
+              audioSourceId = track.id;
               const inTrak = inAudio.getTrackById(track.id) || inAudio.moov?.traks?.[0];
               const entry = inTrak?.mdia?.minf?.stbl?.stsd?.entries?.[0];
               const entryType = entry?.type || (track.codec ? track.codec.substring(0, 4) : 'mp4a');
@@ -203,6 +221,8 @@ export async function muxMp4(
             for (let i = 0; i < samples.length; i++) {
               const sample = samples[i];
               if (sample) {
+                if (sample.data.byteLength === 0) throw new Error('音频样本为空');
+                audioSamples++;
                 outMp4.addSample(audioOutTrackId, sample.data, {
                   duration: sample.duration,
                   dts: sample.dts,
@@ -221,7 +241,7 @@ export async function muxMp4(
         };
 
         inAudio.onError = (err) => {
-          logger.warn('Muxer', `音频样本解析警告: ${err}`);
+          parseError = `音频样本解析失败: ${err}`;
         };
       }
 
@@ -231,11 +251,11 @@ export async function muxMp4(
         vBuf.fileStart = 0;
         inVideo.appendBuffer(vBuf);
         inVideo.flush();
+        validateTrack(inVideo, videoSourceId, videoOutTrackId, videoSamples, '视频轨');
         videoDone = true;
       } catch (vErr: unknown) {
         const msg = getErrorMessage(vErr);
-        logger.warn('Muxer', `视频流解析异常，直接使用原始视频流: ${msg}`, null, traceId);
-        resolve(new Blob([videoBuffer], { type: 'video/mp4' }));
+        reject(new Error(`视频流解析失败: ${msg}`));
         return;
       }
 
@@ -245,11 +265,12 @@ export async function muxMp4(
           aBuf.fileStart = 0;
           inAudio.appendBuffer(aBuf);
           inAudio.flush();
+          validateTrack(inAudio, audioSourceId, audioOutTrackId, audioSamples, '音频轨');
           audioDone = true;
         } catch (aErr: unknown) {
           const msg = getErrorMessage(aErr);
-          logger.warn('Muxer', `音频流解析异常，跳过音频混流: ${msg}`, null, traceId);
-          audioDone = true;
+          reject(new Error(`音频流解析失败: ${msg}`));
+          return;
         }
       }
 

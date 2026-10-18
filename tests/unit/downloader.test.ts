@@ -68,6 +68,16 @@ describe('Downloader Unit Tests', () => {
     );
   });
 
+  it('reports mux failure without saving a file or reporting completion', async () => {
+    vi.mocked(muxMp4).mockRejectedValueOnce(new Error('视频轨样本不完整'));
+    const progress = vi.fn();
+    await expect(downloadAndMuxMp4('损坏视频', mockVideo, mockAudio, progress))
+      .rejects.toThrow('视频轨样本不完整');
+    expect(GM_download).not.toHaveBeenCalled();
+    expect(progress).toHaveBeenCalledWith(expect.objectContaining({ status: 'error' }));
+    expect(progress).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'completed' }));
+  });
+
   it('should save with "_仅画面(无声)" suffix and skip muxMp4 when audio is undefined', async () => {
     const progressUpdates: unknown[] = [];
     const onProgress = vi.fn((state) => progressUpdates.push(state));
